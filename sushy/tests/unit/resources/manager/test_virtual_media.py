@@ -345,6 +345,86 @@ class VirtualMediaTestCase(base.TestCase):
             headers={"If-Match": 'W/"3d7b8a7360bf2941d"'})
         self.assertTrue(self.sys_virtual_media._is_stale)
 
+    def _property_unknown(self, *names):
+        response = mock.MagicMock(status_code=http_client.BAD_REQUEST)
+        response.json.return_value = {'error': {
+            '@Message.ExtendedInfo': [
+                {'MessageId': 'Base.0.10.PropertyUnknown',
+                 'MessageArgs': [name]} for name in names]}}
+        return exceptions.BadRequestError(
+            'PATCH', '/redfish/v1/Managers/BMC/VirtualMedia/Floppy1',
+            response)
+
+    def _patch_outcomes(self, *outcomes):
+        """Script PATCH's results, returning a copy of each body sent."""
+        outcomes = iter(outcomes)
+        bodies = []
+
+        def patch(uri, data=None, headers=None):
+            bodies.append(dict(data))
+            outcome = next(outcomes)
+            if outcome is not None:
+                raise outcome
+
+        self.conn.patch.side_effect = patch
+        return bodies
+
+    def _use_insert_patch(self, **headers):
+        self.conn.get.return_value.headers = {'Allow': 'GET,HEAD,PATCH',
+                                              **headers}
+        self.sys_virtual_media._actions.insert_media = None
+
+    def test_insert_media_fallback_drops_each_unknown_property(self):
+        image = "https://www.dmtf.org/freeImages/Sardine.img"
+        self._use_insert_patch()
+        bodies = self._patch_outcomes(
+            self._property_unknown('Inserted'),
+            self._property_unknown('WriteProtected'),
+            None)
+        self.sys_virtual_media.insert_media(image, True, True)
+        self.assertEqual(
+            [{"Image": image, "Inserted": True, "WriteProtected": True},
+             {"Image": image, "WriteProtected": True},
+             {"Image": image}], bodies)
+        self.assertTrue(self.sys_virtual_media._is_stale)
+
+    def test_insert_media_fallback_drops_all_named_at_once(self):
+        image = "https://www.dmtf.org/freeImages/Sardine.img"
+        self._use_insert_patch()
+        bodies = self._patch_outcomes(
+            self._property_unknown('Inserted', 'WriteProtected'), None)
+        self.sys_virtual_media.insert_media(image, True, True)
+        self.assertEqual({"Image": image}, bodies[1])
+        self.assertEqual(2, len(bodies))
+
+    def test_insert_media_fallback_retry_keeps_etag(self):
+        self._use_insert_patch(ETag='"3d7b8a7360bf2941d"')
+        self._patch_outcomes(self._property_unknown('Inserted'), None)
+        self.sys_virtual_media.insert_media(
+            "https://www.dmtf.org/freeImages/Sardine.img", True, True)
+        for call in self.conn.patch.call_args_list:
+            self.assertEqual({"If-Match": '"3d7b8a7360bf2941d"'},
+                             call.kwargs['headers'])
+
+    def test_insert_media_fallback_other_unknown_property_raises(self):
+        self._use_insert_patch()
+        bodies = self._patch_outcomes(self._property_unknown('Image'))
+        self.assertRaises(
+            exceptions.BadRequestError, self.sys_virtual_media.insert_media,
+            "https://www.dmtf.org/freeImages/Sardine.img", True, True)
+        self.assertEqual(1, len(bodies))
+
+    def test_eject_media_fallback_drops_unknown_inserted(self):
+        self.conn.get.return_value.headers = {'Allow': 'GET,HEAD,PATCH'}
+        self.sys_virtual_media._actions.eject_media = None
+        bodies = self._patch_outcomes(
+            self._property_unknown('Inserted'), None)
+        self.sys_virtual_media.eject_media()
+        self.assertEqual([{"Image": None, "Inserted": False},
+                          {"Image": None}], bodies)
+        self.conn.post.assert_not_called()
+        self.assertTrue(self.sys_virtual_media._is_stale)
+
     def test_eject_media_pass_empty_dict_415(self):
         target_uri = ("/redfish/v1/Managers/BMC/VirtualMedia/Floppy1/Actions"
                       "/VirtualMedia.EjectMedia")

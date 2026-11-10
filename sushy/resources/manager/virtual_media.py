@@ -188,6 +188,46 @@ class VirtualMedia(base.ResourceBase):
             return True
         return False
 
+    def _unknown_patch_properties(self, error, payload):
+        """Return the optional PATCH properties the BMC refused as unknown
+
+        :param error: the HTTPError the PATCH raised
+        :param payload: the PATCH body that was sent
+        :returns: the names to drop before retrying, empty if none
+        """
+        if error.status_code != http_client.BAD_REQUEST:
+            return []
+        info = error.extended_info
+        unknown = set()
+        for message in info if isinstance(info, list) else [info]:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get('MessageId', '')).endswith('.PropertyUnknown'):
+                unknown.update(message.get('MessageArgs') or [])
+        return [name for name in ('Inserted', 'WriteProtected')
+                if name in unknown and name in payload]
+
+    def _patch_media(self, target_uri, payload, headers):
+        """PATCH the media, retrying without properties the BMC doesn't know
+
+        HPE iLO 4 answers 400 PropertyUnknown naming Inserted, but mounts
+        the image and reports Inserted true for a PATCH of Image alone. Each
+        retry removes a property, so this sends at most 3 requests.
+        """
+        while True:
+            try:
+                self._conn.patch(target_uri, data=payload, headers=headers)
+                return
+            except exceptions.HTTPError as error:
+                unknown = self._unknown_patch_properties(error, payload)
+                if not unknown:
+                    raise
+                LOG.info('BMC refused %(properties)s on virtual media '
+                         '%(id)s as unknown, retrying without.',
+                         {'properties': unknown, 'id': self.identity})
+                for name in unknown:
+                    del payload[name]
+
     def insert_media(self, image, inserted=True, write_protected=True,
                      username=None, password=None, transfer_method=None,
                      transfer_protocol=None):
@@ -249,7 +289,7 @@ class VirtualMedia(base.ResourceBase):
             etag = self._get_etag()
             if etag is not None:
                 headers = {"If-Match": etag}
-            self._conn.patch(target_uri, data=payload, headers=headers)
+            self._patch_media(target_uri, payload, headers)
         else:
             # NOTE(janders) only include Inserted and WriteProtected
             # in request payload if values other than defaults (True,True)
@@ -310,7 +350,7 @@ class VirtualMedia(base.ResourceBase):
                 etag = self._get_etag()
                 if etag is not None:
                     headers = {"If-Match": etag}
-                self._conn.patch(target_uri, data=payload, headers=headers)
+                self._patch_media(target_uri, payload, headers)
             else:
                 self._conn.post(target_uri)
         except exceptions.HTTPError as response:
